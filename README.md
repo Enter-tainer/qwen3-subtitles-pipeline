@@ -1,130 +1,76 @@
 # qwen3-subtitles-pipeline
 
-A unified subtitle pipeline with one main entry script:
+A subtitle pipeline using Qwen3 ASR with one main entry script:
 
-- `qwen3_subtitles.py`
+- `make_subtitle.py`
 
-The pipeline keeps the same overall structure:
+Pipeline stages:
 
 1. Silero VAD for compute-time chunking
-2. selectable ASR backend
-3. optional alignment
-4. subtitle rechunking
-5. optional bilingual translation (DeepSeek recommended, Gemini optional)
-
-## Supported ASR backends
-
-### 1. `qwen3`
-Good for alignment experiments:
-
-- Qwen3-ASR transcription
-- Qwen3-ForcedAligner timing
-- subtitle re-chunking after alignment
-
-### 2. `funasr`
-Good for faster long-media transcription:
-
-- FunASR / SenseVoiceSmall transcription
-- keeps the same VAD + rechunk main flow
-- can skip alignment and still output SRT quickly
+2. Qwen3-ASR transcription
+3. Optional Qwen3-ForcedAligner timing
+4. Subtitle rechunking
 
 ## Requirements
 
 - Python 3.12+
 - `ffmpeg`
 - `uv`
-- `gemini` CLI (optional)
-- DeepSeek API key for the recommended structured bilingual translation path
 
 ## Setup
 
 ```bash
 uv venv
 source .venv/bin/activate
-uv pip install qwen-asr silero-vad soundfile funasr modelscope
+uv pip install qwen-asr silero-vad soundfile
 ```
-
-If you only want the Qwen3 backend, `funasr` and `modelscope` are optional.
 
 ## Usage
 
-## Qwen3 backend
+### Basic
 
 ```bash
-python qwen3_subtitles.py input.mp4 \
+python make_subtitle.py input.mp4 \
   --language Japanese \
-  --asr-engine qwen3 \
   --output input.ja.srt
 ```
 
-## FunASR / SenseVoice backend
+### Skip alignment
 
 ```bash
-python qwen3_subtitles.py input.mp4 \
+python make_subtitle.py input.mp4 \
   --language Japanese \
-  --asr-engine funasr \
   --no-align \
   --output input.ja.srt
 ```
 
-## Generate bilingual JA-ZH SRT in the same command
+### Key CLI flags
 
-### Recommended: DeepSeek structured translation with batching
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--output` | `<input>.srt` | Output SRT path |
+| `--language` | `Chinese` | Source language for ASR |
+| `--no-align` | off | Skip forced alignment |
+| `--device` | `cpu` | Torch device |
+| `--dtype` | `float32` | Torch dtype (`float32`, `float16`, `bfloat16`) |
+| `--max-sub-chars` | `22` | Max characters per subtitle cue |
+| `--max-sub-duration` | `5.5` | Max seconds per subtitle cue |
+| `--compute-max-chunk-s` | `90.0` | Soft ceiling for VAD chunk length |
+| `--keep-temp` | off | Retain chunk WAVs in `--workdir` |
 
-```bash
-export DEEPSEEK_API_KEY=your_key_here
-python qwen3_subtitles.py input.mp4 \
-  --language Japanese \
-  --asr-engine funasr \
-  --no-align \
-  --bilingual \
-  --translate-with deepseek \
-  --translate-batch-size 60 \
-  --output input.ja.srt
-```
+## Development
 
-This keeps subtitle timestamps untouched because the model only returns `index -> zh`, and the script fills translations back into the original SRT locally.
+### Type checking
 
-### Optional: Gemini direct bilingual generation
-
-```bash
-python qwen3_subtitles.py input.mp4 \
-  --language Japanese \
-  --asr-engine funasr \
-  --no-align \
-  --bilingual \
-  --translate-with gemini \
-  --output input.ja.srt
-```
-
-This can be useful for experiments, but DeepSeek structured translation is more stable for preserving subtitle structure.
-
-## Recommended practical workflow
-
-For long Japanese videos on CPU:
+This project uses [basedpyright](https://github.com/DetachHead/basedpyright) for static type analysis.
 
 ```bash
-export DEEPSEEK_API_KEY=your_key_here
-python qwen3_subtitles.py input.mp4 \
-  --language Japanese \
-  --asr-engine funasr \
-  --no-align \
-  --bilingual \
-  --translate-with deepseek \
-  --translate-batch-size 60
+uv run basedpyright make_subtitle.py
 ```
 
-For alignment experiments:
-
-```bash
-python qwen3_subtitles.py input.mp4 \
-  --language Japanese \
-  --asr-engine qwen3
-```
+Several upstream dependencies (`soundfile`, `silero_vad`, `qwen_asr`) ship without type stubs. To suppress those warnings locally, uncomment the `[tool.basedpyright]` section in `pyproject.toml` and add the relevant libraries to `allowedUntypedLibraries`.
 
 ## Notes
 
-- The main pipeline stays unified; only the ASR engine changes.
-- VAD and subtitle rechunking remain in the same script.
-- On CPU, Qwen3-ASR is significantly slower than FunASR / SenseVoice for long videos.
-- Gemini translation works best when it sees the whole SRT at once instead of translating subtitle lines one by one.
+- VAD and subtitle rechunking are handled in the same script.
+- Use `--no-align` for faster runs when per-token timing is not needed.
