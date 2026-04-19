@@ -6,10 +6,25 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
   "loguru>=0.7.3",
+  "typer>=0.24.1",
+]
+
+[project.optional-dependencies]
+asr = [
   "qwen-asr>=0.0.6",
   "silero-vad",
   "soundfile",
-  "typer>=0.24.1",
+]
+translate = [
+  "openai>=1.0",
+  "python-dotenv>=1.0",
+]
+all = [
+  "qwen-asr>=0.0.6",
+  "silero-vad",
+  "soundfile",
+  "openai>=1.0",
+  "python-dotenv>=1.0",
 ]
 
 [tool.uv]

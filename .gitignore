@@ -10,3 +10,4 @@ __pycache__/
 *.srt
 *.json
 /tmp/
+.env
