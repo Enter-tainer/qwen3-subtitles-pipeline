@@ -367,6 +367,18 @@ def srt_ts(sec: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
 
 
+def extend_subtitles(
+    items: list[SubtitleItem], extend_s: float, min_gap_s: float = 0.08
+) -> list[SubtitleItem]:
+    """Extend each subtitle's end time, ensuring min_gap_s between consecutive cues."""
+    if extend_s <= 0:
+        return items
+    for i, item in enumerate(items):
+        max_end = items[i + 1].start - min_gap_s if i + 1 < len(items) else float("inf")
+        item.end = min(item.end + extend_s, max_end)
+    return items
+
+
 def write_srt(items: list[SubtitleItem], path: Path):
     with path.open("w", encoding="utf-8") as f:
         for idx, item in enumerate(items, 1):
@@ -442,6 +454,9 @@ def main(
     silence_gap_s: Annotated[
         float, typer.Option(help="Silence gap for rechunking (s)")
     ] = 0.55,
+    sub_extend_s: Annotated[
+        float, typer.Option(help="Extend subtitle end time by this many seconds")
+    ] = 0.5,
     keep_temp: Annotated[
         bool, typer.Option("--keep-temp", help="Retain chunk WAVs")
     ] = False,
@@ -579,6 +594,9 @@ def main(
             )
 
     all_items.sort(key=lambda x: x.start)
+    if sub_extend_s > 0:
+        extend_subtitles(all_items, sub_extend_s, min_gap_s=0.08)
+        logger.info("extended subtitle end times by {:.2f}s (min gap 80ms)", sub_extend_s)
     logger.info("writing srt {}", out)
     write_srt(all_items, out)
     debug_path = workdir / ".debug.json"
