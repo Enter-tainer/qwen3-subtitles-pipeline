@@ -6,7 +6,9 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from dataclasses import asdict, dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, TypedDict, cast
 
@@ -119,6 +121,32 @@ class SubtitleItem:
     start: float
     end: float
     text: str
+
+
+class BreakStrength(enum.IntEnum):
+    NONE = 0
+    SOFT = 1
+    MEDIUM = 2
+    HARD = 3
+
+
+@dataclass(frozen=True)
+class BreakCandidate:
+    pos: int
+    strength: BreakStrength
+    gap: float = 0.0
+
+
+@dataclass(frozen=True)
+class SegmentInfo:
+    start_pos: int
+    end_pos: int
+    text: str
+    start: float
+    end: float
+    raw_duration: float
+    chars: int
+    punct_chars: int
 
 
 def detect_compute_chunks(
@@ -323,6 +351,204 @@ def split_long_text(text: str, max_chars: int) -> list[str]:
     return parts
 
 
+HARD_BREAK_PUNCT = set("。！？!?")
+MEDIUM_BREAK_PUNCT = set("；;：:")
+SOFT_BREAK_PUNCT = set("，、,")
+TRAILING_CLOSERS = set("”’」』）》〉）)]】】")
+
+
+def break_strength_for_char(ch: str) -> BreakStrength:
+    if ch in HARD_BREAK_PUNCT:
+        return BreakStrength.HARD
+    if ch in MEDIUM_BREAK_PUNCT:
+        return BreakStrength.MEDIUM
+    if ch in SOFT_BREAK_PUNCT:
+        return BreakStrength.SOFT
+    return BreakStrength.NONE
+
+
+def token_break_strength(text: str) -> BreakStrength:
+    strength = BreakStrength.NONE
+    for ch in text:
+        strength = max(strength, break_strength_for_char(ch))
+    return strength
+
+
+def is_trailing_closer_token(text: str) -> bool:
+    if not text:
+        return False
+    saw_closer = False
+    for ch in text:
+        if ch.isspace():
+            continue
+        if ch not in TRAILING_CLOSERS:
+            return False
+        saw_closer = True
+    return saw_closer
+
+
+def boundary_punctuation_strength(tokens: list[TokenStamp], boundary_pos: int) -> BreakStrength:
+    k = boundary_pos - 1
+    while k >= 0 and tokens[k].text.isspace():
+        k -= 1
+    saw_closer = False
+    while k >= 0 and is_trailing_closer_token(tokens[k].text):
+        saw_closer = True
+        k -= 1
+    if k < 0:
+        return BreakStrength.NONE
+    strength = token_break_strength(tokens[k].text)
+    if strength == BreakStrength.NONE:
+        return BreakStrength.NONE
+    if saw_closer or k == boundary_pos - 1:
+        return strength
+    return BreakStrength.NONE
+
+
+def boundary_pause_strength(
+    tokens: list[TokenStamp], boundary_pos: int, silence_gap_s: float
+) -> tuple[BreakStrength, float]:
+    if boundary_pos <= 0 or boundary_pos >= len(tokens):
+        return BreakStrength.NONE, 0.0
+    gap = max(0.0, tokens[boundary_pos].start - tokens[boundary_pos - 1].end)
+    if gap < silence_gap_s:
+        return BreakStrength.NONE, gap
+    if gap >= max(silence_gap_s * 2.0, silence_gap_s + 0.45):
+        return BreakStrength.HARD, gap
+    if gap >= max(silence_gap_s * 1.45, silence_gap_s + 0.2):
+        return BreakStrength.MEDIUM, gap
+    return BreakStrength.SOFT, gap
+
+
+def build_break_candidates(tokens: list[TokenStamp], silence_gap_s: float) -> list[BreakCandidate]:
+    boundary_map: dict[int, BreakCandidate] = {
+        0: BreakCandidate(pos=0, strength=BreakStrength.HARD, gap=0.0)
+    }
+    for boundary_pos in range(1, len(tokens)):
+        punct_strength = boundary_punctuation_strength(tokens, boundary_pos)
+        pause_strength, gap = boundary_pause_strength(tokens, boundary_pos, silence_gap_s)
+        strength = max(punct_strength, pause_strength)
+        if strength == BreakStrength.NONE:
+            continue
+        prev = boundary_map.get(boundary_pos)
+        candidate = BreakCandidate(pos=boundary_pos, strength=strength, gap=gap)
+        if prev is None or candidate.strength > prev.strength or candidate.gap > prev.gap:
+            boundary_map[boundary_pos] = candidate
+    boundary_map[len(tokens)] = BreakCandidate(
+        pos=len(tokens), strength=BreakStrength.HARD, gap=0.0
+    )
+    return [boundary_map[pos] for pos in sorted(boundary_map)]
+
+
+def build_segment_info(
+    tokens: list[TokenStamp],
+    start_pos: int,
+    end_pos: int,
+    min_duration: float,
+) -> SegmentInfo | None:
+    seg_tokens = tokens[start_pos:end_pos]
+    if not seg_tokens:
+        return None
+
+    text = "".join(t.text for t in seg_tokens).strip()
+    if not text:
+        return None
+
+    start_tok = next((tok for tok in seg_tokens if tok.text.strip()), None)
+    end_tok = next((tok for tok in reversed(seg_tokens) if tok.text.strip()), None)
+    if start_tok is None or end_tok is None:
+        return None
+
+    raw_duration = max(0.0, end_tok.end - start_tok.start)
+    punct_chars = 0
+    chars = 0
+    for ch in text:
+        if ch.isspace():
+            continue
+        chars += 1
+        if unicodedata.category(ch).startswith("P"):
+            punct_chars += 1
+
+    return SegmentInfo(
+        start_pos=start_pos,
+        end_pos=end_pos,
+        text=text,
+        start=start_tok.start,
+        end=max(end_tok.end, start_tok.start + min_duration),
+        raw_duration=raw_duration,
+        chars=chars,
+        punct_chars=punct_chars,
+    )
+
+
+def cube_badness(amount: float, scale: float) -> float:
+    if amount <= 0:
+        return 0.0
+    return (amount / max(scale, 1e-6)) ** 3
+
+
+def segment_badness(
+    segment: SegmentInfo,
+    end_boundary: BreakCandidate,
+    skipped_soft: int,
+    skipped_medium: int,
+    skipped_hard: int,
+    max_chars: int,
+    max_duration: float,
+    min_duration: float,
+) -> float:
+    if skipped_hard > 0:
+        return float("inf")
+
+    target_chars = max(8, round(max_chars * 0.82))
+    min_chars = max(5, round(max_chars * 0.45))
+    target_duration = min(max_duration * 0.72, 3.2)
+
+    char_cost = 0.0
+    if segment.chars < target_chars:
+        char_cost += 40.0 * cube_badness(target_chars - segment.chars, max(target_chars - min_chars, 2))
+    else:
+        char_cost += 55.0 * cube_badness(segment.chars - target_chars, max(max_chars - target_chars, 2))
+    if segment.chars < min_chars:
+        char_cost += 140.0 * cube_badness(min_chars - segment.chars, max(min_chars, 2))
+    if segment.chars > max_chars:
+        char_cost += 260.0 * cube_badness(segment.chars - max_chars, max(max_chars, 2))
+
+    duration_cost = 0.0
+    if segment.raw_duration < min_duration:
+        duration_cost += 18.0 * cube_badness(min_duration - segment.raw_duration, max(min_duration, 0.4))
+    if segment.raw_duration > target_duration:
+        duration_cost += 28.0 * cube_badness(
+            segment.raw_duration - target_duration,
+            max(max_duration - target_duration, 0.5),
+        )
+    if segment.raw_duration > max_duration:
+        duration_cost += 120.0 * cube_badness(
+            segment.raw_duration - max_duration,
+            max(max_duration, 0.5),
+        )
+
+    density_allowance = 1 + segment.chars // 12
+    punct_cost = 16.0 * cube_badness(
+        segment.punct_chars - density_allowance,
+        max(density_allowance, 1),
+    )
+
+    skip_cost = skipped_soft * 14.0 + skipped_medium * 48.0
+    skip_cost += 6.0 * (skipped_soft + skipped_medium) ** 2
+
+    end_cost = {
+        BreakStrength.HARD: 0.0,
+        BreakStrength.MEDIUM: 4.0,
+        BreakStrength.SOFT: 10.0,
+        BreakStrength.NONE: 18.0,
+    }[end_boundary.strength]
+    if end_boundary.gap > 0:
+        end_cost -= min(end_boundary.gap, 1.2) * 6.0
+
+    return char_cost + duration_cost + punct_cost + skip_cost + end_cost
+
+
 def merge_close(
     items: list[SubtitleItem],
     gap_s: float = 0.12,
@@ -357,55 +583,117 @@ def rechunk_tokens(
 ) -> list[SubtitleItem]:
     if not tokens:
         return []
-    hard_punct = set("。！？!?；;")
-    soft_punct = set("，、：,:")
+    candidates = build_break_candidates(tokens, silence_gap_s)
+    if len(candidates) <= 2:
+        text = "".join(t.text for t in tokens).strip()
+        if not text:
+            return []
+        start = next((tok.start for tok in tokens if tok.text.strip()), tokens[0].start)
+        end = next((tok.end for tok in reversed(tokens) if tok.text.strip()), tokens[-1].end)
+        return [SubtitleItem(start, max(end, start + min_duration), text)]
+
+    soft_prefix = [0]
+    medium_prefix = [0]
+    hard_prefix = [0]
+    for candidate in candidates:
+        soft_prefix.append(soft_prefix[-1] + int(candidate.strength == BreakStrength.SOFT))
+        medium_prefix.append(
+            medium_prefix[-1] + int(candidate.strength == BreakStrength.MEDIUM)
+        )
+        hard_prefix.append(hard_prefix[-1] + int(candidate.strength == BreakStrength.HARD))
+
+    @lru_cache(maxsize=None)
+    def get_segment(candidate_i: int, candidate_j: int) -> SegmentInfo | None:
+        return build_segment_info(
+            tokens,
+            candidates[candidate_i].pos,
+            candidates[candidate_j].pos,
+            min_duration,
+        )
+
+    def skipped_counts(candidate_i: int, candidate_j: int) -> tuple[int, int, int]:
+        lo = candidate_i + 1
+        hi = candidate_j
+        return (
+            soft_prefix[hi] - soft_prefix[lo],
+            medium_prefix[hi] - medium_prefix[lo],
+            hard_prefix[hi] - hard_prefix[lo],
+        )
+
+    inf = float("inf")
+    n = len(candidates)
+    dp = [inf] * n
+    prev = [-1] * n
+    dp[0] = 0.0
+
+    for end_idx in range(1, n):
+        end_boundary = candidates[end_idx]
+        best_cost = inf
+        best_prev = -1
+
+        for start_idx in range(end_idx - 1, -1, -1):
+            if dp[start_idx] == inf:
+                continue
+
+            segment = get_segment(start_idx, end_idx)
+            if segment is None:
+                continue
+
+            skipped_soft, skipped_medium, skipped_hard = skipped_counts(start_idx, end_idx)
+            penalty = segment_badness(
+                segment,
+                end_boundary,
+                skipped_soft,
+                skipped_medium,
+                skipped_hard,
+                max_chars=max_chars,
+                max_duration=max_duration,
+                min_duration=min_duration,
+            )
+            if penalty == inf:
+                continue
+
+            total_cost = dp[start_idx] + penalty
+            if total_cost < best_cost:
+                best_cost = total_cost
+                best_prev = start_idx
+
+            if (
+                skipped_hard > 0
+                or segment.chars > max_chars * 2
+                or segment.raw_duration > max_duration * 2
+            ):
+                break
+
+        if best_prev >= 0:
+            dp[end_idx] = best_cost
+            prev[end_idx] = best_prev
+
+    if prev[-1] < 0:
+        text = "".join(t.text for t in tokens).strip()
+        if not text:
+            return []
+        start = next((tok.start for tok in tokens if tok.text.strip()), tokens[0].start)
+        end = next((tok.end for tok in reversed(tokens) if tok.text.strip()), tokens[-1].end)
+        return [SubtitleItem(start, max(end, start + min_duration), text)]
+
+    path: list[int] = []
+    cur = n - 1
+    while cur > 0:
+        path.append(cur)
+        cur = prev[cur]
+        if cur < 0:
+            break
+    path.append(0)
+    path.reverse()
+
     items: list[SubtitleItem] = []
-    buf: list[TokenStamp] = []
-
-    def flush(force: bool = False):
-        nonlocal buf
-        if not buf:
-            return
-        raw_text = "".join(t.text for t in buf).strip()
-        if not raw_text:
-            buf = []
-            return
-        start = buf[0].start
-        end = max(buf[-1].end, start + min_duration)
-        if (not force) and len(raw_text) > max_chars * 1.6:
-            subparts = split_long_text(raw_text, max_chars)
-            span = max(end - start, min_duration)
-            step = span / len(subparts)
-            cur_start = start
-            for i, part in enumerate(subparts):
-                cur_end = end if i == len(subparts) - 1 else cur_start + step
-                items.append(SubtitleItem(cur_start, cur_end, part))
-                cur_start = cur_end
-        else:
-            items.append(SubtitleItem(start, end, raw_text))
-        buf = []
-
-    for tok in tokens:
-        if not tok.text.strip():
+    for start_idx, end_idx in zip(path, path[1:]):
+        segment = get_segment(start_idx, end_idx)
+        if segment is None:
             continue
-        gap = max(0.0, tok.start - buf[-1].end) if buf else 0.0
-        if buf and gap >= silence_gap_s:
-            flush()
-        buf.append(tok)
-        text_now = "".join(t.text for t in buf).strip()
-        duration_now = buf[-1].end - buf[0].start
-        last_char = buf[-1].text[-1] if buf[-1].text else ""
-        if (
-            last_char in hard_punct
-            or (last_char in soft_punct and len(text_now) >= max(8, max_chars // 2))
-            or duration_now >= max_duration
-            or (len(text_now) >= max_chars and contains_cjk(text_now))
-        ):
-            flush(force=True)
-    flush(force=True)
-    return merge_close(
-        items, gap_s=0.12, max_chars=max_chars, max_duration=max_duration + 0.8
-    )
+        items.append(SubtitleItem(segment.start, segment.end, segment.text))
+    return items
 
 
 def srt_ts(sec: float) -> str:
@@ -428,7 +716,7 @@ def extend_subtitles(
         return items
     for i, item in enumerate(items):
         max_end = items[i + 1].start - min_gap_s if i + 1 < len(items) else float("inf")
-        item.end = min(item.end + extend_s, max_end)
+        item.end = max(item.start, min(item.end + extend_s, max_end))
     return items
 
 
