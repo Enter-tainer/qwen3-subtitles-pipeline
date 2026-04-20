@@ -248,6 +248,55 @@ def force_align_chunk(
     return out
 
 
+def inject_punctuation_tokens(
+    original_text: str, tokens: list[TokenStamp]
+) -> list[TokenStamp]:
+    """Insert synthetic tokens for punctuation stripped by the aligner.
+
+    Qwen3ForcedAligner strips punctuation before alignment, so rechunk_tokens
+    never sees hard_punct/soft_punct. This walks the original text and injects
+    minimal-duration tokens for every punctuation character at the boundary
+    position of the preceding token.
+    """
+    if not tokens:
+        return []
+
+    import unicodedata
+
+    def is_punct(ch: str) -> bool:
+        if ch == "'":
+            return False
+        return unicodedata.category(ch).startswith("P")
+
+    # Map each cleaned-text char position → token index
+    char_to_token: list[int] = []
+    for i, tok in enumerate(tokens):
+        for _ in range(len(tok.text)):
+            char_to_token.append(i)
+
+    cleaned_pos = 0
+    last_token_idx = -1
+    result: list[TokenStamp] = []
+
+    for ch in original_text:
+        if is_punct(ch):
+            prev_end = result[-1].end if result else 0.0
+            result.append(TokenStamp(text=ch, start=prev_end, end=prev_end + 0.01))
+        else:
+            if cleaned_pos < len(char_to_token):
+                tok_idx = char_to_token[cleaned_pos]
+                if tok_idx != last_token_idx:
+                    result.append(tokens[tok_idx])
+                    last_token_idx = tok_idx
+                cleaned_pos += 1
+
+    # Append any remaining tokens not yet covered
+    for i in range(last_token_idx + 1, len(tokens)):
+        result.append(tokens[i])
+
+    return result
+
+
 def contains_cjk(s: str) -> bool:
     return any("\u4e00" <= ch <= "\u9fff" for ch in s)
 
@@ -569,6 +618,7 @@ def main(
                 continue
             try:
                 tokens = force_align_chunk(aligner, chunk_path, text, language)
+                tokens = inject_punctuation_tokens(text, tokens)
             except Exception as e:
                 logger.error("align chunk {} failed: {}", idx, e)
                 continue
