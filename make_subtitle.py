@@ -428,6 +428,208 @@ def extend_subtitles(
     return items
 
 
+class Stage(str, enum.Enum):
+    EXTRACT = "extract"
+    VAD = "vad"
+    ASR = "asr"
+    ALIGN = "align"
+    RECHUNK = "rechunk"
+
+
+def build_chunk_infos(chunks: list[SpeechChunk], chunks_dir: Path) -> list[tuple[int, SpeechChunk, Path]]:
+    infos: list[tuple[int, SpeechChunk, Path]] = []
+    for idx, chunk in enumerate(chunks, 1):
+        infos.append((idx, chunk, chunks_dir / f"chunk_{idx:04d}.wav"))
+    return infos
+
+
+def run_vad(
+    audio: Path,
+    chunks_dir: Path,
+    chunks_json: Path,
+    threshold: float,
+    min_silence_ms: int,
+    min_speech_ms: int,
+    speech_pad_ms: int,
+    compute_max_chunk_s: float | None,
+    hard_max_chunk_s: float | None,
+) -> list[SpeechChunk]:
+    logger.info(
+        "[vad] threshold={}, min_silence_ms={}, min_speech_ms={}, max_chunk_s={}",
+        threshold, min_silence_ms, min_speech_ms, compute_max_chunk_s,
+    )
+    chunks = detect_compute_chunks(
+        audio, threshold, min_silence_ms, min_speech_ms, speech_pad_ms,
+        compute_max_chunk_s, hard_max_chunk_s,
+    )
+    if not chunks:
+        logger.error("No speech detected")
+        sys.exit(2)
+    logger.info("[vad] detected {} chunks", len(chunks))
+    chunks_json.write_text(
+        json.dumps([asdict(c) for c in chunks], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    chunks_dir.mkdir(exist_ok=True)
+    for idx, chunk in enumerate(chunks, 1):
+        trim_audio(audio, chunks_dir / f"chunk_{idx:04d}.wav", chunk.start, chunk.end)
+    return chunks
+
+
+def load_chunks(chunks_json: Path, chunks_dir: Path) -> list[SpeechChunk]:
+    if not chunks_json.exists():
+        logger.error("chunks.json not found: {} (need --from-stage vad first)", chunks_json)
+        sys.exit(2)
+    data = json.loads(chunks_json.read_text(encoding="utf-8"))
+    chunks = [SpeechChunk(**d) for d in data]
+    for idx, chunk in enumerate(chunks, 1):
+        chunk_path = chunks_dir / f"chunk_{idx:04d}.wav"
+        if not chunk_path.exists():
+            logger.error("chunk wav not found: {} (need --from-stage vad first)", chunk_path)
+            sys.exit(2)
+    logger.info("[vad] loaded {} chunks from {}", len(chunks), chunks_json)
+    return chunks
+
+
+def run_asr(
+    chunk_infos: list[tuple[int, SpeechChunk, Path]],
+    transcripts_json: Path,
+    model: str,
+    device: str,
+    dtype: str,
+    language: str,
+) -> dict[int, str]:
+    logger.info("[asr] loading engine: {} (device={}, dtype={})", model, device, dtype)
+    engine = init_qwen_asr(model, device, dtype)
+    transcripts: dict[int, str] = {}
+    for idx, chunk, chunk_path in chunk_infos:
+        logger.info("[asr] chunk {}/{} {:.2f}-{:.2f}s", idx, len(chunk_infos), chunk.start, chunk.end)
+        try:
+            transcripts[idx] = transcribe_chunk(engine, chunk_path, language)
+        except Exception as e:
+            logger.error("[asr] chunk {} failed: {}", idx, e)
+    del engine
+    import gc as _gc
+    _ = _gc.collect()
+    transcripts_json.write_text(
+        json.dumps({str(k): v for k, v in transcripts.items()}, ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info("[asr] saved {} transcripts to {}", len(transcripts), transcripts_json)
+    return transcripts
+
+
+def load_transcripts(transcripts_json: Path) -> dict[int, str]:
+    if not transcripts_json.exists():
+        logger.error("transcripts.json not found: {} (need --from-stage asr first)", transcripts_json)
+        sys.exit(2)
+    raw = json.loads(transcripts_json.read_text(encoding="utf-8"))
+    logger.info("[asr] loaded {} transcripts from {}", len(raw), transcripts_json)
+    return {int(k): v for k, v in raw.items()}
+
+
+def run_align(
+    chunk_infos: list[tuple[int, SpeechChunk, Path]],
+    transcripts: dict[int, str],
+    tokens_json: Path,
+    model: str,
+    device: str,
+    dtype: str,
+    language: str,
+    max_sub_chars: int,
+    max_sub_duration: float,
+    silence_gap_s: float,
+) -> tuple[list[TokenStamp], list[SubtitleItem], list[dict[str, object]]]:
+    logger.info("[align] loading engine: {} (device={}, dtype={})", model, device, dtype)
+    aligner = init_aligner(model, device, dtype)
+    all_tokens: list[TokenStamp] = []
+    all_items: list[SubtitleItem] = []
+    debug: list[dict[str, object]] = []
+
+    for idx, chunk, chunk_path in chunk_infos:
+        text = transcripts.get(idx, "").strip()
+        logger.info("[align] chunk {}/{} {:.2f}-{:.2f}s", idx, len(chunk_infos), chunk.start, chunk.end)
+        if not text:
+            continue
+        try:
+            tokens = force_align_chunk(aligner, chunk_path, text, language)
+            tokens = inject_punctuation_tokens(text, tokens)
+            for t in tokens:
+                t.start += chunk.start
+                t.end += chunk.start
+            all_tokens.extend(tokens)
+        except Exception as e:
+            logger.error("[align] chunk {} failed: {}", idx, e)
+            continue
+        subs = rechunk_tokens(tokens, max_sub_chars, max_sub_duration, silence_gap_s=silence_gap_s)
+        for s in subs:
+            all_items.append(s)
+        debug.append({
+            "chunk_index": idx,
+            "start": chunk.start,
+            "end": chunk.end,
+            "transcript": text,
+            "tokens": [asdict(t) for t in tokens],
+            "subtitles": [asdict(s) for s in subs],
+        })
+
+    all_tokens.sort(key=lambda x: x.start)
+    tokens_json.write_text(
+        json.dumps([asdict(t) for t in all_tokens], ensure_ascii=False),
+        encoding="utf-8",
+    )
+    logger.info("[align] saved {} tokens to {}", len(all_tokens), tokens_json)
+    return all_tokens, all_items, debug
+
+
+def run_rechunk_from_tokens(
+    tokens_json: Path,
+    max_sub_chars: int,
+    max_sub_duration: float,
+    silence_gap_s: float,
+) -> list[SubtitleItem]:
+    if not tokens_json.exists():
+        logger.error("tokens.json not found: {} (need --from-stage align first)", tokens_json)
+        sys.exit(2)
+    data = json.loads(tokens_json.read_text(encoding="utf-8"))
+    tokens = [TokenStamp(**d) for d in data]
+    logger.info("[rechunk] loaded {} tokens from {}", len(tokens), tokens_json)
+    return rechunk_tokens(tokens, max_sub_chars, max_sub_duration, silence_gap_s=silence_gap_s)
+
+
+def run_no_align_rechunk(
+    chunk_infos: list[tuple[int, SpeechChunk, Path]],
+    transcripts: dict[int, str],
+    max_sub_chars: int,
+) -> tuple[list[SubtitleItem], list[dict[str, object]]]:
+    logger.info("[rechunk] alignment skipped; coarse chunk timings + split")
+    all_items: list[SubtitleItem] = []
+    debug: list[dict[str, object]] = []
+    for idx, chunk, _chunk_path in chunk_infos:
+        text = transcripts.get(idx, "").strip()
+        if not text:
+            continue
+        parts = split_long_text(text, max_sub_chars)
+        span = max(chunk.end - chunk.start, 0.8)
+        step = span / max(len(parts), 1)
+        cur = chunk.start
+        subs: list[SubtitleItem] = []
+        for i, part in enumerate(parts):
+            end = chunk.end if i == len(parts) - 1 else cur + step
+            sub = SubtitleItem(cur, end, part)
+            subs.append(sub)
+            all_items.append(sub)
+            cur = end
+        debug.append({
+            "chunk_index": idx,
+            "start": chunk.start,
+            "end": chunk.end,
+            "transcript": text,
+            "subtitles": [asdict(s) for s in subs],
+        })
+    return all_items, debug
+
+
 def write_srt(items: list[SubtitleItem], path: Path):
     with path.open("w", encoding="utf-8") as f:
         for idx, item in enumerate(items, 1):
@@ -467,6 +669,9 @@ def write_bilingual_srt_from_map(src: Path, out: Path, translations: dict[int, s
 def main(
     input: Annotated[Path, typer.Argument(help="Input media file")],
     output: Annotated[Path | None, typer.Option(help="Output SRT path")] = None,
+    from_stage: Annotated[
+        Stage, typer.Option("--from-stage", help="Start from this stage")
+    ] = Stage.EXTRACT,
     workdir: Annotated[
         Path, typer.Option(help="Working directory for temp files")
     ] = Path("tmp/qwen3_subtitles"),  # pyright: ignore[reportCallInDefaultInitializer]
@@ -514,141 +719,63 @@ def main(
     src = input.resolve()
     out = output.resolve() if output else src.with_suffix(".srt")
     workdir = workdir.resolve()
-    asr_model_id = asr_model
-    aligner_model_id = aligner_model
-
     workdir.mkdir(parents=True, exist_ok=True)
+
     audio = workdir / f"{src.stem}.16k.wav"
     chunks_dir = workdir / "chunks"
-    chunks_dir.mkdir(exist_ok=True)
+    chunks_json = workdir / "chunks.json"
+    transcripts_json = workdir / "transcripts.json"
+    tokens_json = workdir / "tokens.json"
 
-    logger.info("extracting audio: {} -> {}", src, audio)
-    extract_audio(src, audio)
-
-    logger.info(
-        f"compute chunks via silero vad ({threshold=}, {min_silence_ms=}, {min_speech_ms=}, {compute_max_chunk_s=}, {hard_max_chunk_s=})"
-    )
-    chunks = detect_compute_chunks(
-        audio,
-        threshold,
-        min_silence_ms,
-        min_speech_ms,
-        speech_pad_ms,
-        compute_max_chunk_s,
-        hard_max_chunk_s,
-    )
-    if not chunks:
-        logger.error("No speech detected")
+    # Stage: extract
+    if from_stage <= Stage.EXTRACT:
+        logger.info("[extract] {} -> {}", src, audio)
+        extract_audio(src, audio)
+    elif not audio.exists():
+        logger.error("audio not found: {} (need --from-stage extract first)", audio)
         sys.exit(2)
-    logger.info("detected {} compute chunks", len(chunks))
 
-    chunk_infos: list[tuple[int, SpeechChunk, Path]] = []
-    for idx, chunk in enumerate(chunks, 1):
-        chunk_path = chunks_dir / f"chunk_{idx:04d}.wav"
-        trim_audio(audio, chunk_path, chunk.start, chunk.end)
-        chunk_infos.append((idx, chunk, chunk_path))
-
-    logger.info(
-        "loading ASR engine: {} (device={}, dtype={})",
-        asr_model_id,
-        device,
-        dtype,
-    )
-    asr = init_qwen_asr(asr_model_id, device, dtype)
-    transcripts: dict[int, str] = {}
-    for idx, chunk, chunk_path in chunk_infos:
-        logger.info(
-            "asr compute chunk {}/{} {:.2f}-{:.2f}s",
-            idx,
-            len(chunk_infos),
-            chunk.start,
-            chunk.end,
+    # Stage: vad
+    if from_stage <= Stage.VAD:
+        chunks = run_vad(
+            audio, chunks_dir, chunks_json, threshold, min_silence_ms,
+            min_speech_ms, speech_pad_ms, compute_max_chunk_s, hard_max_chunk_s,
         )
-        try:
-            transcripts[idx] = transcribe_chunk(asr, chunk_path, language)
-        except Exception as e:
-            logger.error("asr chunk {} failed: {}", idx, e)
-    del asr
-    import gc
-
-    _ = gc.collect()
-
-    all_items: list[SubtitleItem] = []
-    debug: list[dict[str, object]] = []
-
-    if no_align:
-        logger.info("alignment skipped; using coarse chunk timings + rechunk-by-text")
-        for idx, chunk, _chunk_path in chunk_infos:
-            text = transcripts.get(idx, "").strip()
-            if not text:
-                continue
-            parts = split_long_text(text, max_sub_chars)
-            span = max(chunk.end - chunk.start, 0.8)
-            step = span / max(len(parts), 1)
-            cur = chunk.start
-            subs: list[SubtitleItem] = []
-            for i, part in enumerate(parts):
-                end = chunk.end if i == len(parts) - 1 else cur + step
-                sub = SubtitleItem(cur, end, part)
-                subs.append(sub)
-                all_items.append(sub)
-                cur = end
-            debug.append(
-                {
-                    "chunk_index": idx,
-                    "start": chunk.start,
-                    "end": chunk.end,
-                    "transcript": text,
-                    "subtitles": [asdict(s) for s in subs],
-                }
-            )
     else:
-        logger.info("loading qwen forced aligner...")
-        aligner = init_aligner(aligner_model_id, device, dtype)
-        for idx, chunk, chunk_path in chunk_infos:
-            text = transcripts.get(idx, "").strip()
-            logger.info(
-                "align compute chunk {}/{} {:.2f}-{:.2f}s",
-                idx,
-                len(chunk_infos),
-                chunk.start,
-                chunk.end,
-            )
-            if not text:
-                continue
-            try:
-                tokens = force_align_chunk(aligner, chunk_path, text, language)
-                tokens = inject_punctuation_tokens(text, tokens)
-            except Exception as e:
-                logger.error("align chunk {} failed: {}", idx, e)
-                continue
-            subs = rechunk_tokens(
-                tokens,
-                max_sub_chars,
-                max_sub_duration,
-                silence_gap_s=silence_gap_s,
-            )
-            for s in subs:
-                s.start += chunk.start
-                s.end += chunk.start
-                all_items.append(s)
-            debug.append(
-                {
-                    "chunk_index": idx,
-                    "start": chunk.start,
-                    "end": chunk.end,
-                    "transcript": text,
-                    "tokens": [asdict(t) for t in tokens],
-                    "subtitles": [asdict(s) for s in subs],
-                }
-            )
+        chunks = load_chunks(chunks_json, chunks_dir)
 
+    chunk_infos = build_chunk_infos(chunks, chunks_dir)
+
+    # Stage: asr
+    if from_stage <= Stage.ASR:
+        transcripts = run_asr(
+            chunk_infos, transcripts_json, asr_model, device, dtype, language,
+        )
+    else:
+        transcripts = load_transcripts(transcripts_json)
+
+    # Stage: align + rechunk
+    if no_align:
+        all_items, debug = run_no_align_rechunk(chunk_infos, transcripts, max_sub_chars)
+    elif from_stage <= Stage.ALIGN:
+        _tokens, all_items, debug = run_align(
+            chunk_infos, transcripts, tokens_json, aligner_model, device, dtype,
+            language, max_sub_chars, max_sub_duration, silence_gap_s,
+        )
+    else:
+        all_items = run_rechunk_from_tokens(
+            tokens_json, max_sub_chars, max_sub_duration, silence_gap_s,
+        )
+        debug = []
+
+    # Write output
     all_items.sort(key=lambda x: x.start)
     if sub_extend_s > 0:
         extend_subtitles(all_items, sub_extend_s, min_gap_s=0.08)
         logger.info("extended subtitle end times by {:.2f}s (min gap 80ms)", sub_extend_s)
     logger.info("writing srt {}", out)
     write_srt(all_items, out)
+
     debug_path = workdir / ".debug.json"
     _ = debug_path.write_text(
         json.dumps(debug, ensure_ascii=False, indent=2), encoding="utf-8"
