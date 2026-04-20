@@ -251,44 +251,48 @@ def force_align_chunk(
 def inject_punctuation_tokens(
     original_text: str, tokens: list[TokenStamp]
 ) -> list[TokenStamp]:
-    """Insert synthetic tokens for punctuation stripped by the aligner.
+    """Insert minimal-duration tokens for any characters dropped by the aligner.
 
-    Qwen3ForcedAligner strips punctuation before alignment, so rechunk_tokens
-    never sees hard_punct/soft_punct. This walks the original text and injects
-    minimal-duration tokens for every punctuation character at the boundary
-    position of the preceding token.
+    Treat the aligned token text as a subsequence of the original transcript:
+    whenever the next character in ``original_text`` does not match the next
+    aligned character, inject it back as a synthetic token anchored to the
+    previous token boundary. Synthetic tokens get a tiny duration, capped by
+    the next real token start so they never overlap with aligned speech.
     """
     if not tokens:
         return []
 
-    import unicodedata
-
-    def is_punct(ch: str) -> bool:
-        if ch == "'":
-            return False
-        return unicodedata.category(ch).startswith("P")
-
-    # Map each cleaned-text char position → token index
-    char_to_token: list[int] = []
+    aligned_chars: list[tuple[str, int]] = []
     for i, tok in enumerate(tokens):
-        for _ in range(len(tok.text)):
-            char_to_token.append(i)
+        for ch in tok.text:
+            aligned_chars.append((ch, i))
 
-    cleaned_pos = 0
+    aligned_pos = 0
     last_token_idx = -1
     result: list[TokenStamp] = []
+    synthetic_duration_s = 0.01
+
+    def append_synthetic(ch: str, next_token_idx: int | None) -> None:
+        anchor = result[-1].end if result else tokens[0].start
+        end = anchor + synthetic_duration_s
+        if next_token_idx is not None:
+            end = max(anchor, min(end, tokens[next_token_idx].start))
+        result.append(TokenStamp(text=ch, start=anchor, end=end))
 
     for ch in original_text:
-        if is_punct(ch):
-            prev_end = result[-1].end if result else 0.0
-            result.append(TokenStamp(text=ch, start=prev_end, end=prev_end + 0.01))
-        else:
-            if cleaned_pos < len(char_to_token):
-                tok_idx = char_to_token[cleaned_pos]
-                if tok_idx != last_token_idx:
-                    result.append(tokens[tok_idx])
-                    last_token_idx = tok_idx
-                cleaned_pos += 1
+        if aligned_pos >= len(aligned_chars):
+            append_synthetic(ch, None)
+            continue
+
+        aligned_ch, tok_idx = aligned_chars[aligned_pos]
+        if ch != aligned_ch:
+            append_synthetic(ch, tok_idx)
+            continue
+
+        if tok_idx != last_token_idx:
+            result.append(tokens[tok_idx])
+            last_token_idx = tok_idx
+        aligned_pos += 1
 
     # Append any remaining tokens not yet covered
     for i in range(last_token_idx + 1, len(tokens)):
