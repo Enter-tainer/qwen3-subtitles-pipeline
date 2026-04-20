@@ -720,12 +720,31 @@ def extend_subtitles(
     return items
 
 
+_STAGE_ORDER = ["extract", "vad", "asr", "align", "rechunk"]
+
+
 class Stage(str, enum.Enum):
     EXTRACT = "extract"
     VAD = "vad"
     ASR = "asr"
     ALIGN = "align"
     RECHUNK = "rechunk"
+
+    @property
+    def _idx(self) -> int:
+        return _STAGE_ORDER.index(self.value)
+
+    def __lt__(self, other: "Stage") -> bool:
+        return self._idx < other._idx
+
+    def __le__(self, other: "Stage") -> bool:
+        return self._idx <= other._idx
+
+    def __gt__(self, other: "Stage") -> bool:
+        return self._idx > other._idx
+
+    def __ge__(self, other: "Stage") -> bool:
+        return self._idx >= other._idx
 
 
 def build_chunk_infos(chunks: list[SpeechChunk], chunks_dir: Path) -> list[tuple[int, SpeechChunk, Path]]:
