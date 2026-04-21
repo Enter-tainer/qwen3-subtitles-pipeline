@@ -22,6 +22,8 @@ from dotenv import load_dotenv
 from loguru import logger
 from openai import OpenAI
 
+from llm_utils import extract_json, llm_call_with_feedback
+
 load_dotenv()
 
 app = typer.Typer()
@@ -89,57 +91,8 @@ Example Input:
 Example Output:
 {{"1": "我说了，", "2": "随它去吧！"}}"""
 
-FEEDBACK_TEMPLATE = """\
-Your previous response failed JSON validation.
-Errors/Issues to fix: {issues}
-
-Original input batch:
-{original}
-
-Instructions:
-1. Fix the JSON syntax errors (e.g., check for unescaped quotes, trailing commas, or missing brackets).
-2. Ensure the output contains exactly these keys: {keys}
-3. Output ONLY a valid JSON object starting with `{{` and ending with `}}`. Do not include ANY text outside the JSON."""
-
-
 def _build_system_prompt(target_lang: str) -> str:
     return SYSTEM_PROMPT.format(target_lang=target_lang)
-
-
-def _extract_json(text: str) -> dict | None:
-    """Try to extract a JSON object from LLM response (handles markdown fences)."""
-    text = text.strip()
-    # strip ```json ... ``` wrappers
-    m = re.search(r"```(?:json)?\s*\n?(.*?)```", text, re.DOTALL)
-    if m:
-        text = m.group(1).strip()
-    try:
-        obj = json.loads(text)
-        if isinstance(obj, dict):
-            return obj
-    except json.JSONDecodeError:
-        pass
-    return None
-
-
-def _validate_batch(result: dict, expected_keys: set[str]) -> list[str]:
-    """Return list of issue descriptions (empty == valid)."""
-    issues: list[str] = []
-    if not isinstance(result, dict):
-        issues.append("Response is not a JSON object")
-        return issues
-    result_keys = set(result.keys())
-    missing = expected_keys - result_keys
-    extra = result_keys - expected_keys
-    if missing:
-        issues.append(f"Missing keys: {sorted(missing)}")
-    if extra:
-        issues.append(f"Extra keys: {sorted(extra)}")
-    for k, v in result.items():
-        if not isinstance(v, str):
-            issues.append(f"Value for key '{k}' is not a string")
-            break
-    return issues
 
 
 def translate_batch(
@@ -153,66 +106,14 @@ def translate_batch(
     expected_keys = set(batch.keys())
     system = _build_system_prompt(target_lang)
     user_msg = json.dumps(batch, ensure_ascii=False)
-    messages: list[dict] = [
-        {"role": "system", "content": system},
-        {"role": "user", "content": user_msg},
-    ]
-
-    for attempt in range(1, max_retries + 2):  # 1 initial + max_retries feedback
-        resp = client.chat.completions.create(
-            model=model,
-            messages=messages,  # pyright: ignore[reportArgumentType]
-            temperature=0.3,
+    try:
+        result = llm_call_with_feedback(
+            client, model, system, user_msg, expected_keys, max_retries=max_retries
         )
-        raw = resp.choices[0].message.content or ""
-        parsed = _extract_json(raw)
-
-        if parsed is None:
-            issues_text = "Response is not valid JSON"
-            logger.warning(
-                "batch keys {}-{} attempt {}: not valid JSON",
-                min(expected_keys),
-                max(expected_keys),
-                attempt,
-            )
-        else:
-            issues = _validate_batch(parsed, expected_keys)
-            if not issues:
-                return {k: str(v) for k, v in parsed.items()}
-            issues_text = "; ".join(issues)
-            logger.warning(
-                "batch keys {}-{} attempt {}: {}",
-                min(expected_keys),
-                max(expected_keys),
-                attempt,
-                issues_text,
-            )
-
-        if attempt > max_retries:
-            break
-
-        # append feedback for retry
-        feedback = FEEDBACK_TEMPLATE.format(
-            issues=issues_text,
-            original=user_msg,
-            keys=sorted(expected_keys),
-        )
-        messages.append({"role": "assistant", "content": raw})
-        messages.append({"role": "user", "content": feedback})
-
-    logger.error(
-        "batch keys {}-{} failed after {} retries, returning partial/empty",
-        min(expected_keys),
-        max(expected_keys),
-        max_retries,
-    )
-    # return whatever we managed to parse, filling gaps with originals
-    fallback = dict(batch)
-    if parsed and isinstance(parsed, dict):
-        for k in expected_keys:
-            if k in parsed and isinstance(parsed[k], str):
-                fallback[k] = parsed[k]
-    return fallback
+        return {k: str(v) for k, v in result.items()}
+    except ValueError:
+        logger.error("batch keys {}-{} failed after {} retries, returning originals", min(expected_keys), max(expected_keys), max_retries)
+        return dict(batch)
 
 
 # ── Output ───────────────────────────────────────────────────────────────────
