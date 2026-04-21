@@ -7,13 +7,20 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Annotated, TypedDict, cast
 
 import typer
+from dotenv import load_dotenv
 from loguru import logger
+from openai import OpenAI
+
+from llm_utils import extract_json, llm_call_with_feedback
+
+load_dotenv()
 
 import torch
 import numpy as np
@@ -720,13 +727,14 @@ def extend_subtitles(
     return items
 
 
-_STAGE_ORDER = ["extract", "vad", "asr", "align", "rechunk"]
+_STAGE_ORDER = ["extract", "vad", "asr", "post", "align", "rechunk"]
 
 
 class Stage(str, enum.Enum):
     EXTRACT = "extract"
     VAD = "vad"
     ASR = "asr"
+    POST = "post"
     ALIGN = "align"
     RECHUNK = "rechunk"
 
@@ -837,6 +845,90 @@ def load_transcripts(transcripts_json: Path) -> dict[int, str]:
     raw = json.loads(transcripts_json.read_text(encoding="utf-8"))
     logger.info("[asr] loaded {} transcripts from {}", len(raw), transcripts_json)
     return {int(k): v for k, v in raw.items()}
+
+
+_LLM_POST_SYSTEM_PROMPT = """\
+You are a light ASR text post-processor.
+You will receive a JSON object where each key is a chunk index and each value is the raw ASR transcript text.
+Clean up every value. Keep each key unchanged.
+
+Post-processing Guidelines:
+1. Add proper punctuation and sentence breaks (. , ? ! etc. — use the punctuation conventions of the text's language).
+2. Fix obvious recognition errors: incorrect number formats (e.g. "三十五" vs "35" — choose the more natural form based on context), homophone typos, repeated words, etc.
+3. Polish toward written language — remove obvious spoken redundancies (filler words, false starts) while preserving the original meaning.
+4. Do NOT add information not present in the original, do NOT rephrase heavily, do NOT change the core content.
+
+Output Requirements:
+- Return ONLY a valid JSON object.
+- Start your response exactly with `{{` and end with `}}`.
+- NO markdown fences (do NOT use ```json). NO explanations.
+- CRITICAL: Properly escape any double quotes inside the strings (e.g., use \\" instead of ").
+"""
+
+
+def _post_process_batch(
+    client: OpenAI,
+    model: str,
+    batch: dict[str, str],
+    language: str,
+) -> dict[str, str]:
+    system = _LLM_POST_SYSTEM_PROMPT
+    user_msg = f"Language: {language}\n{json.dumps(batch, ensure_ascii=False)}"
+    expected_keys = set(batch.keys())
+    result = llm_call_with_feedback(
+        client, model, system, user_msg, expected_keys,
+        max_retries=3, temperature=0.3,
+    )
+    return {k: str(v) for k, v in result.items()}
+
+
+def run_llm_post(
+    transcripts: dict[int, str],
+    api_key: str,
+    api_base: str,
+    model: str,
+    language: str,
+    batch_size: int,
+    thread_num: int,
+) -> dict[int, str]:
+    logger.info("[post] LLM post-processing {} transcripts (model={}, language={})", len(transcripts), model, language)
+    client = OpenAI(api_key=api_key, base_url=api_base)
+
+    str_dict = {str(k): v for k, v in transcripts.items()}
+    keys = list(str_dict.keys())
+    batches = [{k: str_dict[k] for k in keys[i:i + batch_size]} for i in range(0, len(keys), batch_size)]
+    logger.info("[post] split into {} batches (batch_size={}, threads={})", len(batches), batch_size, thread_num)
+
+    results: dict[str, str] = {}
+    failed = 0
+
+    with ThreadPoolExecutor(max_workers=thread_num) as pool:
+        futures = {
+            pool.submit(_post_process_batch, client, model, batch, language): i
+            for i, batch in enumerate(batches)
+        }
+        for future in as_completed(futures):
+            batch_idx = futures[future]
+            try:
+                result = future.result()
+                results.update(result)
+                logger.info("[post] batch {}/{} done", batch_idx + 1, len(batches))
+            except Exception as e:
+                failed += 1
+                # fall back to original texts for this batch
+                batch = batches[batch_idx]
+                results.update(batch)
+                logger.warning("[post] batch {}/{} failed: {}, keeping originals", batch_idx + 1, len(batches), e)
+
+    if failed == len(batches):
+        logger.error("[post] all batches failed, aborting")
+        sys.exit(2)
+
+    if failed > 0:
+        logger.warning("[post] {}/{} batches failed, using original texts for those", failed, len(batches))
+
+    # restore int keys
+    return {int(k): v for k, v in results.items()}
 
 
 def run_align(
@@ -1025,6 +1117,24 @@ def main(
     keep_temp: Annotated[
         bool, typer.Option("--keep-temp", help="Retain chunk WAVs")
     ] = False,
+    llm_post: Annotated[
+        bool, typer.Option("--llm-post", help="Enable LLM post-processing of ASR transcripts")
+    ] = False,
+    llm_post_model: Annotated[
+        str, typer.Option(help="LLM model for post-processing")
+    ] = "deepseek-chat",
+    llm_post_api_key: Annotated[
+        str | None, typer.Option(envvar="LLM_API_KEY", help="API key for LLM post-processing (or set LLM_API_KEY)")
+    ] = None,
+    llm_post_api_base: Annotated[
+        str | None, typer.Option(envvar="LLM_API_BASE", help="API base URL for LLM post-processing (or set LLM_API_BASE)")
+    ] = None,
+    llm_post_batch_size: Annotated[
+        int, typer.Option(help="Chunks per LLM request")
+    ] = 10,
+    llm_post_threads: Annotated[
+        int, typer.Option(help="Parallel threads for LLM post-processing")
+    ] = 4,
 ) -> None:
     """Integrated subtitle pipeline: VAD -> ASR backend -> optional align -> rechunk -> optional bilingual translation"""
     src = input.resolve()
@@ -1064,6 +1174,25 @@ def main(
         )
     else:
         transcripts = load_transcripts(transcripts_json)
+
+    # Stage: post (optional LLM post-processing)
+    if llm_post:
+        if from_stage <= Stage.POST:
+            if not llm_post_api_key:
+                logger.error("[post] API key required: set LLM_API_KEY env var or pass --llm-post-api-key")
+                sys.exit(2)
+            api_base = llm_post_api_base or "https://api.deepseek.com"
+            transcripts = run_llm_post(
+                transcripts, llm_post_api_key, api_base, llm_post_model,
+                language, llm_post_batch_size, llm_post_threads,
+            )
+            # Overwrite transcripts.json with post-processed version
+            transcripts_json.write_text(
+                json.dumps({str(k): v for k, v in transcripts.items()}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info("[post] saved {} post-processed transcripts to {}", len(transcripts), transcripts_json)
+        # if from_stage > POST, transcripts already loaded from file (post-processed from previous run)
 
     # Stage: align + rechunk
     if no_align:
