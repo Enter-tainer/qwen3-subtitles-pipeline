@@ -31,6 +31,14 @@ import soundfile as sf
 from silero_vad import load_silero_vad, get_speech_timestamps
 
 
+try:
+    import flash_attn as _flash_attn  # noqa: F401
+
+    _HAS_FLASH_ATTN = True
+except ModuleNotFoundError:
+    _HAS_FLASH_ATTN = False
+
+
 class DType(str, enum.Enum):
     float32 = "float32"
     float16 = "float16"
@@ -242,6 +250,13 @@ def clean_sensevoice_text(text: str) -> str:
     return normalize_text(text)
 
 
+def _model_kwargs() -> dict:
+    kwargs: dict = {}
+    if _HAS_FLASH_ATTN:
+        kwargs["attn_implementation"] = "flash_attention_2"
+    return kwargs
+
+
 def init_qwen_asr(model_id: str, device: str, dtype_name: str) -> Qwen3ASRModel:
     return Qwen3ASRModel.from_pretrained(
         model_id,
@@ -249,6 +264,7 @@ def init_qwen_asr(model_id: str, device: str, dtype_name: str) -> Qwen3ASRModel:
         max_inference_batch_size=8,
         max_new_tokens=2048,
         device_map=device,
+        **_model_kwargs(),
     )
 
 
@@ -257,6 +273,7 @@ def init_aligner(model_id: str, device: str, dtype_name: str) -> Qwen3ForcedAlig
         model_id,
         device_map=device,
         dtype=getattr(torch, dtype_name),  # pyright: ignore [reportAny]
+        **_model_kwargs(),
     )
 
 
@@ -1150,7 +1167,7 @@ def main(
     dtype: Annotated[DType, typer.Option(help="Torch dtype")] = DType.bfloat16,
     asr_model: Annotated[
         str, typer.Option(help="Qwen3 ASR model ID")
-    ] = "Qwen/Qwen3-ASR-0.6B",
+    ] = "Qwen/Qwen3-ASR-1.7B",
     aligner_model: Annotated[
         str, typer.Option(help="Qwen3 forced aligner model ID")
     ] = "Qwen/Qwen3-ForcedAligner-0.6B",
