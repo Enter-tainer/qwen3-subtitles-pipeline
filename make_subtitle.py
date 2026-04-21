@@ -246,7 +246,7 @@ def init_qwen_asr(model_id: str, device: str, dtype_name: str) -> Qwen3ASRModel:
     return Qwen3ASRModel.from_pretrained(
         model_id,
         dtype=getattr(torch, dtype_name),  # pyright: ignore [reportAny]
-        max_inference_batch_size=1,
+        max_inference_batch_size=8,
         max_new_tokens=2048,
         device_map=device,
     )
@@ -878,12 +878,22 @@ def run_asr(
     logger.info("[asr] loading engine: {} (device={}, dtype={})", model, device, dtype)
     engine = init_qwen_asr(model, device, dtype)
     transcripts: dict[int, str] = {}
-    for idx, chunk, chunk_path in chunk_infos:
-        logger.info("[asr] chunk {}/{} {:.2f}-{:.2f}s", idx, len(chunk_infos), chunk.start, chunk.end)
-        try:
-            transcripts[idx] = transcribe_chunk(engine, chunk_path, language)
-        except Exception as e:
-            logger.error("[asr] chunk {} failed: {}", idx, e)
+
+    paths = [str(p) for _, _, p in chunk_infos]
+    try:
+        results = engine.transcribe(audio=paths, language=language)
+        for (idx, _chunk, _path), result in zip(chunk_infos, results):
+            transcripts[idx] = normalize_text(result.text)
+            logger.info("[asr] chunk {} done", idx)
+    except Exception as e:
+        logger.warning("[asr] batch transcription failed ({}), falling back to sequential", e)
+        for idx, chunk, chunk_path in chunk_infos:
+            logger.info("[asr] chunk {}/{} {:.2f}-{:.2f}s", idx, len(chunk_infos), chunk.start, chunk.end)
+            try:
+                transcripts[idx] = transcribe_chunk(engine, chunk_path, language)
+            except Exception as e2:
+                logger.error("[asr] chunk {} failed: {}", idx, e2)
+
     del engine
     import gc as _gc
     _ = _gc.collect()
@@ -1137,7 +1147,7 @@ def main(
     ] = Path("tmp/qwen3_subtitles"),  # pyright: ignore[reportCallInDefaultInitializer]
     language: Annotated[str, typer.Option(help="Source language for ASR")] = "Chinese",
     device: Annotated[str, typer.Option(help="Torch device")] = "cpu",
-    dtype: Annotated[DType, typer.Option(help="Torch dtype")] = DType.float32,
+    dtype: Annotated[DType, typer.Option(help="Torch dtype")] = DType.bfloat16,
     asr_model: Annotated[
         str, typer.Option(help="Qwen3 ASR model ID")
     ] = "Qwen/Qwen3-ASR-0.6B",
