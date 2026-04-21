@@ -286,54 +286,111 @@ def force_align_chunk(
 def inject_punctuation_tokens(
     original_text: str, tokens: list[TokenStamp]
 ) -> list[TokenStamp]:
-    """Insert minimal-duration tokens for any characters dropped by the aligner.
+    """Insert minimal-duration tokens for characters dropped by the aligner.
 
-    Treat the aligned token text as a subsequence of the original transcript:
-    whenever the next character in ``original_text`` does not match the next
-    aligned character, inject it back as a synthetic token anchored to the
-    previous token boundary. Synthetic tokens get a tiny duration, capped by
-    the next real token start so they never overlap with aligned speech.
+    Uses difflib.SequenceMatcher (case-insensitive) to fuzzy-match the
+    aligned token text against the original transcript.  Characters present
+    in the original but absent from the aligned output (typically punctuation)
+    are injected as synthetic tokens with a tiny duration, anchored to the
+    preceding real-token boundary.
+
+    When a multi-character token has merged characters that should have been
+    separated by punctuation (e.g. aligner outputs ``"F18"`` for original
+    ``"f1.8"``), the token's text is corrected to the original span so the
+    punctuation is preserved.  Synthetic tokens whose original position falls
+    inside a corrected token span are removed to avoid duplication.
     """
     if not tokens:
         return []
 
-    aligned_chars: list[tuple[str, int]] = []
-    for i, tok in enumerate(tokens):
-        for ch in tok.text:
-            aligned_chars.append((ch, i))
+    import difflib
 
-    aligned_pos = 0
-    last_token_idx = -1
+    aligned_text = "".join(t.text for t in tokens)
+
+    # map each position in aligned_text → token index
+    token_of_pos: list[int] = []
+    for i, tok in enumerate(tokens):
+        token_of_pos.extend([i] * len(tok.text))
+
+    matcher = difflib.SequenceMatcher(
+        None, original_text.lower(), aligned_text.lower(), autojunk=False
+    )
+
     result: list[TokenStamp] = []
+    last_token_idx = -1
     synthetic_duration_s = 0.01
 
-    def append_synthetic(ch: str, next_token_idx: int | None) -> None:
-        anchor = result[-1].end if result else tokens[0].start
-        end = anchor + synthetic_duration_s
-        if next_token_idx is not None:
-            end = max(anchor, min(end, tokens[next_token_idx].start))
-        result.append(TokenStamp(text=ch, start=anchor, end=end))
+    # original-text positions covered by each token during 'equal' opcodes
+    token_orig_positions: dict[int, list[int]] = {}
+    # track which result entries are synthetic and their original position
+    synthetic_entries: dict[int, int] = {}  # result_index → orig_pos
 
-    for ch in original_text:
-        if aligned_pos >= len(aligned_chars):
-            append_synthetic(ch, None)
+    def _next_real_start(after_aligned_pos: int) -> float:
+        for j in range(after_aligned_pos, len(token_of_pos)):
+            return tokens[token_of_pos[j]].start
+        return tokens[-1].end
+
+    for op, orig_start, orig_end, aligned_start, aligned_end in matcher.get_opcodes():
+        if op == "equal":
+            for offset in range(aligned_end - aligned_start):
+                j = aligned_start + offset
+                if j >= len(token_of_pos):
+                    break
+                tok_idx = token_of_pos[j]
+                orig_pos = orig_start + offset
+                token_orig_positions.setdefault(tok_idx, []).append(orig_pos)
+
+                if tok_idx != last_token_idx:
+                    result.append(tokens[tok_idx])
+                    last_token_idx = tok_idx
+
+        elif op in ("delete", "replace"):
+            for pos in range(orig_start, orig_end):
+                ch = original_text[pos]
+                anchor = result[-1].end if result else tokens[0].start
+                next_start = _next_real_start(aligned_start)
+                end = max(anchor, min(anchor + synthetic_duration_s, next_start))
+                synthetic_entries[len(result)] = pos
+                result.append(TokenStamp(text=ch, start=anchor, end=end))
+
+        # 'insert' → skip (aligner hallucination)
+
+    # ── correct token texts from matched original spans ──────────────
+    covered_orig_positions: set[int] = set()
+
+    for i, item in enumerate(result):
+        if i in synthetic_entries:
             continue
-
-        aligned_ch, tok_idx = aligned_chars[aligned_pos]
-        if ch != aligned_ch:
-            append_synthetic(ch, tok_idx)
+        tok_idx = _find_token_index(item, tokens)
+        if tok_idx is None or tok_idx not in token_orig_positions:
             continue
+        positions = token_orig_positions[tok_idx]
+        lo = min(positions)
+        hi = max(positions) + 1  # exclusive
+        covered_orig_positions.update(range(lo, hi))
+        corrected = original_text[lo:hi]
+        if corrected != item.text:
+            result[i] = TokenStamp(text=corrected, start=item.start, end=item.end)
 
-        if tok_idx != last_token_idx:
-            result.append(tokens[tok_idx])
-            last_token_idx = tok_idx
-        aligned_pos += 1
-
-    # Append any remaining tokens not yet covered
-    for i in range(last_token_idx + 1, len(tokens)):
-        result.append(tokens[i])
+    # ── remove synthetic entries whose position is now covered ──────
+    if synthetic_entries:
+        result = [
+            item
+            for i, item in enumerate(result)
+            if i not in synthetic_entries or synthetic_entries[i] not in covered_orig_positions
+        ]
 
     return result
+
+
+def _find_token_index(
+    ts: TokenStamp, candidates: list[TokenStamp]
+) -> int | None:
+    """Return the index of *ts* in *candidates* (identity check)."""
+    for i, t in enumerate(candidates):
+        if ts is t:
+            return i
+    return None
 
 
 def contains_cjk(s: str) -> bool:
